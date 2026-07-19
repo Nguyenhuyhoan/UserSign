@@ -1,146 +1,236 @@
 name: Sign IPA
+
+run-name: Sign IPA - ${{ inputs.request_id }}
+
 on:
   workflow_dispatch:
     inputs:
-      ipa_file:
-        description: 'Tên file IPA'
+      request_id:
+        description: Request ID
         required: true
-      cert_folder:
-        description: 'Thư mục chứng chỉ'
+        type: string
+
+      ipa_path:
+        description: IPA path
         required: true
-      provision_file:
-        description: 'Tên file Provision'
+        type: string
+
+      cert_dir:
+        description: Certificate directory
         required: true
+        type: string
+
+      profiles_json:
+        description: Selected provisioning profiles
+        required: true
+        type: string
+
+permissions:
+  contents: write
 
 jobs:
   sign:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    runs-on: macos-latest
+    timeout-minutes: 30
+
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Cài đặt phụ thuộc
+      - name: Configure Git
         run: |
-          sudo apt-get update
-          sudo apt-get install -y zip unzip libssl-dev g++ git cmake make
+          git config user.name "UserSign Bot"
+          git config user.email "actions@github.com"
 
-      - name: Build zsign
+      - name: Make signing script executable
+        run: chmod +x .github/scripts/sign.sh
+
+      - name: Sign IPA
+        id: signing
+        continue-on-error: true
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+          IPA_PATH: ${{ inputs.ipa_path }}
+          CERT_DIR: ${{ inputs.cert_dir }}
+          PROFILES_JSON: ${{ inputs.profiles_json }}
+          PROFILE_INFO_DIR: ${{ runner.temp }}/usersign-${{ inputs.request_id }}/profiles
+        run: .github/scripts/sign.sh
+
+      - name: Create plist and status
+        id: publish
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+          IPA_INPUT: ${{ inputs.ipa_path }}
+          REPOSITORY: ${{ github.repository }}
+          SIGN_RESULT: ${{ steps.signing.outcome }}
         run: |
           set -e
-          rm -rf zsign
-          git clone --depth 1 https://github.com/zhlynn/zsign.git
-          cd zsign
-          # build/ đã tồn tại trong repo zsign → bắt buộc mkdir -p
-          mkdir -p build
-          cd build
-          cmake ..
-          make -j"$(nproc)"
-          sudo cp zsign /usr/local/bin/zsign
-          which zsign
 
-      - name: Ký IPA
-        run: |
-          set -e
-          IPA_PATH="ipa/${{ github.event.inputs.ipa_file }}"
-          CERT_DIR="cert/${{ github.event.inputs.cert_folder }}"
-          PROV_PATH="${CERT_DIR}/${{ github.event.inputs.provision_file }}"
+          mkdir -p status
 
-          P12_PATH=$(find "$CERT_DIR" -maxdepth 1 -type f \( -iname '*.p12' -o -iname '*.pfx' \) | head -n 1)
+          IPA_FILE="signed-${REQUEST_ID}.ipa"
+          PLIST_FILE="install-${REQUEST_ID}.plist"
 
-          if [ ! -f "$IPA_PATH" ]; then echo "Không thấy IPA: $IPA_PATH"; exit 1; fi
-          if [ -z "$P12_PATH" ] || [ ! -f "$P12_PATH" ]; then echo "Không thấy p12 trong $CERT_DIR"; exit 1; fi
-          if [ ! -f "$PROV_PATH" ]; then echo "Không thấy provision: $PROV_PATH"; exit 1; fi
+          if [[ "${SIGN_RESULT}" != "success" || ! -f "${IPA_FILE}" ]]; then
+            python3 - <<'PY'
+          import json
+          import os
 
-          echo "IPA : $IPA_PATH"
-          echo "P12 : $P12_PATH"
-          echo "PROV: $PROV_PATH"
+          request_id = os.environ["REQUEST_ID"]
 
-          zsign -k "$P12_PATH" -p "1" -m "$PROV_PATH" -o signed_app.ipa "$IPA_PATH"
-          ls -lh signed_app.ipa
+          status = {
+              "request_id": request_id,
+              "status": "failed",
+              "message": "Ký IPA thất bại. Hãy xem log GitHub Actions."
+          }
 
-      - name: Tạo install.plist
-        run: |
-          python3 << 'PY'
-          import os, glob, plistlib, zipfile, shutil
-
-          if os.path.isdir("extracted"):
-              shutil.rmtree("extracted")
-          os.makedirs("extracted", exist_ok=True)
-          with zipfile.ZipFile("signed_app.ipa", "r") as z:
-              z.extractall("extracted")
-
-          apps = glob.glob("extracted/Payload/*.app")
-          if not apps:
-              raise SystemExit("Không tìm thấy .app trong IPA")
-          info_path = os.path.join(apps[0], "Info.plist")
-          with open(info_path, "rb") as f:
-              info = plistlib.load(f)
-
-          bundle_id = info.get("CFBundleIdentifier") or "com.signed.app"
-          app_name = (
-              info.get("CFBundleDisplayName")
-              or info.get("CFBundleName")
-              or "SignedApp"
-          )
-          version = str(
-              info.get("CFBundleShortVersionString")
-              or info.get("CFBundleVersion")
-              or "1.0"
-          )
-
-          repo = os.environ.get("GITHUB_REPOSITORY", "Nguyenhuyhoan/UserSign")
-          ipa_url = f"https://github.com/{repo}/raw/main/signed_app.ipa"
-
-          content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>items</key>
-    <array>
-        <dict>
-            <key>assets</key>
-            <array>
-                <dict>
-                    <key>kind</key>
-                    <string>software-package</string>
-                    <key>url</key>
-                    <string>{ipa_url}</string>
-                </dict>
-            </array>
-            <key>metadata</key>
-            <dict>
-                <key>bundle-identifier</key>
-                <string>{bundle_id}</string>
-                <key>bundle-version</key>
-                <string>{version}</string>
-                <key>kind</key>
-                <string>software</string>
-                <key>title</key>
-                <string>{app_name}</string>
-            </dict>
-        </dict>
-    </array>
-</dict>
-</plist>
-"""
-          with open("install.plist", "w", encoding="utf-8") as f:
-              f.write(content)
-          print("App:", app_name)
-          print("Bundle:", bundle_id)
-          print("Version:", version)
-          print("IPA URL:", ipa_url)
+          with open(f"status/{request_id}.json", "w", encoding="utf-8") as file:
+              json.dump(status, file, ensure_ascii=False, indent=2)
           PY
 
-      - name: Dọn file tạm
-        run: rm -rf extracted zsign
+            echo "ok=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
 
-      - name: Push file đã ký lên Repo
+          FILE_SIZE="$(stat -f%z "${IPA_FILE}")"
+
+          # GitHub không cho commit file lớn hơn 100 MB.
+          if [[ "${FILE_SIZE}" -ge 99000000 ]]; then
+            rm -f "${IPA_FILE}"
+
+            python3 - <<'PY'
+          import json
+          import os
+
+          request_id = os.environ["REQUEST_ID"]
+
+          status = {
+              "request_id": request_id,
+              "status": "failed",
+              "message": "IPA sau khi ký quá lớn để đẩy trực tiếp vào GitHub repository."
+          }
+
+          with open(f"status/{request_id}.json", "w", encoding="utf-8") as file:
+              json.dump(status, file, ensure_ascii=False, indent=2)
+          PY
+
+            echo "ok=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          import plistlib
+          import urllib.parse
+
+          request_id = os.environ["REQUEST_ID"]
+          repository = os.environ["REPOSITORY"]
+
+          ipa_file = f"signed-{request_id}.ipa"
+          plist_file = f"install-{request_id}.plist"
+
+          encoded_ipa = urllib.parse.quote(ipa_file)
+          encoded_plist = urllib.parse.quote(plist_file)
+
+          ipa_url = (
+              f"https://raw.githubusercontent.com/"
+              f"{repository}/main/{encoded_ipa}"
+          )
+
+          plist_url = (
+              f"https://raw.githubusercontent.com/"
+              f"{repository}/main/{encoded_plist}"
+          )
+
+          manifest = {
+              "items": [
+                  {
+                      "assets": [
+                          {
+                              "kind": "software-package",
+                              "url": ipa_url
+                          }
+                      ],
+                      "metadata": {
+                          "bundle-identifier": f"usersign.{request_id}",
+                          "bundle-version": "1.0",
+                          "kind": "software",
+                          "title": "UserSign App"
+                      }
+                  }
+              ]
+          }
+
+          with open(plist_file, "wb") as file:
+              plistlib.dump(manifest, file, fmt=plistlib.FMT_XML)
+
+          status = {
+              "request_id": request_id,
+              "status": "success",
+              "message": "Ký IPA thành công.",
+              "ipa_path": ipa_file,
+              "plist_path": plist_file,
+              "ipa_url": ipa_url,
+              "plist_url": plist_url,
+              "size": os.path.getsize(ipa_file)
+          }
+
+          os.makedirs("status", exist_ok=True)
+
+          with open(
+              f"status/{request_id}.json",
+              "w",
+              encoding="utf-8"
+          ) as file:
+              json.dump(status, file, ensure_ascii=False, indent=2)
+          PY
+
+          echo "ok=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Push result to repository
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add signed_app.ipa install.plist
-          git diff --staged --quiet && echo "Không có thay đổi" && exit 0
-          git commit -m "Auto sign: ${{ github.event.inputs.ipa_file }} / ${{ github.event.inputs.cert_folder }}"
-          git push origin HEAD:main
+          set -e
+
+          git add "status/${REQUEST_ID}.json"
+
+          if [[ -f "signed-${REQUEST_ID}.ipa" ]]; then
+            git add "signed-${REQUEST_ID}.ipa"
+          fi
+
+          if [[ -f "install-${REQUEST_ID}.plist" ]]; then
+            git add "install-${REQUEST_ID}.plist"
+          fi
+
+          if git diff --cached --quiet; then
+            echo "Không có dữ liệu để commit"
+            exit 0
+          fi
+
+          git commit -m "Signed IPA ${REQUEST_ID}"
+
+          for attempt in 1 2 3 4 5; do
+            git pull --rebase origin main || true
+
+            if git push origin HEAD:main; then
+              echo "Push thành công"
+              exit 0
+            fi
+
+            echo "Push thất bại lần ${attempt}, đang thử lại..."
+            sleep $((attempt * 3))
+          done
+
+          echo "Không thể push kết quả"
+          exit 1
+
+      - name: Mark workflow failed
+        if: steps.publish.outputs.ok != 'true'
+        run: |
+          echo "Quá trình ký IPA thất bại"
+          exit 1
+
