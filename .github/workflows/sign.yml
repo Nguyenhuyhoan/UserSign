@@ -1,0 +1,98 @@
+name: Sign IPA
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_file:
+        description: 'Tên file IPA'
+        required: true
+      cert_folder:
+        description: 'Thư mục chứng chỉ'
+        required: true
+      provision_file:
+        description: 'Tên file Provision'
+        required: true
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Cài đặt zsign và các công cụ cần thiết
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip unzip libssl-dev plistutil
+          git clone https://github.com/zhlynn/zsign.git
+          cd zsign
+          g++ *.cpp common/*.cpp openssl/*.cpp -lcrypto -O3 -o zsign
+          sudo cp zsign /usr/local/bin/
+
+      - name: Ký IPA
+        run: |
+          IPA_PATH="ipa/${{ github.event.inputs.ipa_file }}"
+          P12_PATH=$(ls cert/${{ github.event.inputs.cert_folder }}/*.p12 | head -n 1)
+          PROV_PATH="cert/${{ github.event.inputs.cert_folder }}/${{ github.event.inputs.provision_file }}"
+          
+          echo "Đang ký $IPA_PATH bằng $P12_PATH và $PROV_PATH"
+          # zsign giúp giữ nguyên cấu trúc nén, không làm phình dung lượng
+          zsign -k "$P12_PATH" -p "1" -m "$PROV_PATH" -o signed_app.ipa "$IPA_PATH"
+
+      - name: Tạo file install.plist
+        run: |
+          # Giải nén tạm để lấy Bundle ID và Tên App
+          unzip -q signed_app.ipa -d extracted
+          APP_DIR=$(ls -d extracted/Payload/*.app | head -n 1)
+          plistutil -i "$APP_DIR/Info.plist" -o Info_xml.plist
+          
+          BUNDLE_ID=$(grep -A1 'CFBundleIdentifier' Info_xml.plist | tail -n1 | sed -e 's/.*<string>\(.*\)<\/string>.*/\1/')
+          APP_NAME=$(grep -A1 'CFBundleName' Info_xml.plist | tail -n1 | sed -e 's/.*<string>\(.*\)<\/string>.*/\1/')
+          
+          if [ -z "$APP_NAME" ]; then APP_NAME="SignedApp"; fi
+          if [ -z "$BUNDLE_ID" ]; then BUNDLE_ID="com.signed.app"; fi
+          
+          IPA_URL="https://github.com/${{ github.repository }}/raw/main/signed_app.ipa"
+          
+          cat <<EOF > install.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>items</key>
+              <array>
+                  <dict>
+                      <key>assets</key>
+                      <array>
+                          <dict>
+                              <key>kind</key>
+                              <string>software-package</string>
+                              <key>url</key>
+                              <string>$IPA_URL</string>
+                          </dict>
+                      </array>
+                      <key>metadata</key>
+                      <dict>
+                          <key>bundle-identifier</key>
+                          <string>$BUNDLE_ID</string>
+                          <key>bundle-version</key>
+                          <string>1.0</string>
+                          <key>kind</key>
+                          <string>software</string>
+                          <key>title</key>
+                          <string>$APP_NAME</string>
+                      </dict>
+                  </dict>
+              </array>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Push file đã ký lên Repo
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add signed_app.ipa install.plist
+          git commit -m "Auto sign app: ${{ github.event.inputs.ipa_file }}"
+          git push origin main
